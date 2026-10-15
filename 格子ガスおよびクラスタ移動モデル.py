@@ -13,6 +13,8 @@ A(固定・濃度勾配・活性/不活性)とB, S(移動・相互作用で駆�
      よらず、重なりの有無だけで決まる。結合が形成されている間、そのAは確率的に
      不活性化して消える(=A-B結合の寿命は平均1/K_OFF)。Bがそのセルから離れれば
      結合は解消されるが、Aが不活性化する前にBが再び重なれば結合は再形成される。
+     不活性化したAは、B/Sの有無によらず速度定数K_ONで確率的に再活性化する
+     (平均回復時間 = 1/K_ON)。
      Sが重なってもS-A相互作用は0なので結合は生じない(素通りできる)。
 - B, S: 他のB/Sがいない隣接セル(Aが重なっていても構わない)へホップして移動する
      (個々の粒子が単独でホップし、凝集体からのはみ出し・分裂も自由に起こる)。各移動の
@@ -39,7 +41,7 @@ A(固定・濃度勾配・活性/不活性)とB, S(移動・相互作用で駆�
      CLUSTER_MIN_SIZE(=2)未満のクラスタは対象外とする。単体粒子のホップ/スワップ
      だけでは表現できない「凝集体そのものの拡散(ブラウン運動)」を可能にする。
   Gillespieの直接法で「次にどのイベント(ホップ/スワップ/クラスタ移動/Aの
-  不活性化)が、いつ起こるか」を、すべての速度(レート)を1つの反応リストとして
+  不活性化・再活性化)が、いつ起こるか」を、すべての速度(レート)を1つの反応リストとして
   扱い毎ステップ選ぶ。
 - 結合エネルギー Eint: B-B, B-S, B-A(活性なAのみ、オンサイト)を定義。S-S, S-Aは0(相互作用なし)。
 """
@@ -58,13 +60,15 @@ N_A = 200        # A(固定分子)の個数
 N_B = 40        # B(移動分子)の個数
 N_S = 1         # S(移動分子)の個数
 
-E_BB = -4.0     # B-B 結合エネルギー(負が大きいほど強い引力)
-E_BS = -6.0     # B-S 結合エネルギー(B-Bより強め = Sは凝集体に強く保持される)
-E_BA = -5.0     # B-A(活性、オンサイト) 結合エネルギー
+E_BB = -5.0     # B-B 結合エネルギー(負が大きいほど強い引力)
+E_BS = -7.0     # B-S 結合エネルギー(B-Bより強め = Sは凝集体に強く保持される)
+E_BA = -6.0     # B-A(活性、オンサイト) 結合エネルギー
 # S-S, S-A, A-A は相互作用なし(0のまま)
 
 K_OFF = 0.001     # B-A結合(オンサイト)が切れてAが不活性化する速度定数
                 # 平均結合寿命 = 1 / K_OFF。
+K_ON = 0.0001     # 不活性化したAが再び活性化する速度定数(B/Sの有無によらない)
+                # 平均回復時間 = 1 / K_ON。
 
 CLUSTER_MOVE_RATE0 = 1.0       # クラスタ全体並進移動の速度プリファクタ
 CLUSTER_SIZE_EXPONENT = 1.0    # クラスタサイズNによる減速指数(rate ∝ N^-この値)
@@ -96,7 +100,7 @@ def init_state(seed=-1):
     # --- A: 濃度勾配(上ほど密度が高い)で配置。B/Sと重なって存在できるので占有グリッドには入れない ---
     all_cells = np.arange(LX * LY)
     ys_of_cell = all_cells % LY
-    weights = (np.exp(0.04 * ys_of_cell)).astype(float)      # y(上)が大きいほど選ばれやすい
+    weights = np.ones(LX * LY) #(np.exp(0.04 * ys_of_cell)).astype(float)      # y(上)が大きいほど選ばれやすい
     weights /= weights.sum()
     a_cells = rng.choice(all_cells, size=N_A, replace=False, p=weights)
     pos_A = np.stack([a_cells // LY, a_cells % LY], axis=1)
@@ -131,7 +135,7 @@ def init_state(seed=-1):
 
     w = init_rates(xm, ym, spm, occ_mobile, A_pos_to_idx, A_present)
     w_swap = init_swap_rates(xm, ym, spm, occ_mobile, A_pos_to_idx, A_present, occ_idx)
-    wA = init_A_rates(pos_A, occ_mobile)
+    wA = init_A_rates(pos_A, occ_mobile, A_present)
 
     return dict(occ_mobile=occ_mobile, occ_idx=occ_idx, xm=xm, ym=ym, spm=spm, w=w, w_swap=w_swap,
                 pos_A=pos_A, A_present=A_present, A_pos_to_idx=A_pos_to_idx, wA=wA,
@@ -297,21 +301,25 @@ def compute_cluster_move_rates(clusters, xm, ym, spm, occ_mobile, A_pos_to_idx, 
     return w_cluster
 
 
-def compute_A_rate(px, py, occ_mobile):
-    """Aの不活性化速度: 同じセルに重なっている可動粒子との間にB-A結合(Eint!=0)が
+def compute_A_rate(px, py, occ_mobile, active):
+    """Aの状態変化速度。
+    活性Aの不活性化速度: 同じセルに重なっている可動粒子との間にB-A結合(Eint!=0)が
     あればK_OFF、なければ0(オンサイト相互作用なので、隣接ではなく重なりの有無だけで決まる。
     クラスタサイズには依存しない。Sが重なっていてもEint[S,A]=0なので不活性化の
-    トリガーにはならない)。"""
+    トリガーにはならない)。
+    不活性Aの再活性化速度: 周囲の状態によらず常にK_ON。"""
+    if not active:
+        return K_ON
     species = occ_mobile[px, py]
     if species >= 0 and Eint[species, A_TYPE] != 0.0:
         return K_OFF
     return 0.0
 
 
-def init_A_rates(pos_A, occ_mobile):
+def init_A_rates(pos_A, occ_mobile, A_present):
     wA = np.zeros(len(pos_A))
     for i, (px, py) in enumerate(pos_A):
-        wA[i] = compute_A_rate(px, py, occ_mobile)
+        wA[i] = compute_A_rate(px, py, occ_mobile, A_present[i])
     return wA
 
 
@@ -342,10 +350,11 @@ def update_neighbor_mobile_rates(px, py, occ_mobile, occ_idx, xm, ym, spm, A_pos
 def update_A_rate_at(px, py, occ_mobile, A_pos_to_idx, A_present, wA):
     """(px,py)の可動粒子占有状態が変わったとき、そのセルにちょうど重なっている
     活性Aがあれば不活性化速度を更新する(オンサイト相互作用なので、更新対象は
-    近傍ではなくこのセル自身になる)。"""
+    近傍ではなくこのセル自身になる)。不活性Aの再活性化速度K_ONは占有状態に
+    依存しないので更新不要。"""
     idx = A_pos_to_idx.get((int(px), int(py)))
     if idx is not None and A_present[idx]:
-        wA[idx] = compute_A_rate(px, py, occ_mobile)
+        wA[idx] = compute_A_rate(px, py, occ_mobile, True)
     return wA
 
 
@@ -379,7 +388,7 @@ def step(state):
     clusters = find_clusters(xm, ym, occ_mobile, occ_idx)
     w_cluster = compute_cluster_move_rates(clusters, xm, ym, spm, occ_mobile, A_pos_to_idx, A_present)
 
-    # 反応リスト = [B/Sのホップ] + [B/Sのスワップ] + [クラスタの剛体並進移動] + [Aの不活性化]
+    # 反応リスト = [B/Sのホップ] + [B/Sのスワップ] + [クラスタの剛体並進移動] + [Aの不活性化/再活性化]
     wflat = w.reshape(-1)
     wswap_flat = w_swap.reshape(-1)
     wcluster_flat = w_cluster.reshape(-1)
@@ -467,13 +476,15 @@ def step(state):
             w, w_swap, wA = update_around(nx, ny, occ_mobile, occ_idx, xm, ym, spm, A_pos_to_idx, A_present, w, w_swap, wA)
 
     else:
-        # --- Aの不活性化(オンサイトのB-A結合がK_OFFで確率的に切れて、Aが消える) ---
+        # --- Aの不活性化(オンサイトのB-A結合がK_OFFで確率的に切れて、Aが消える)
+        #     または再活性化(不活性AがK_ONで確率的に復活する) ---
         a_idx = k - n_hop - n_swap - n_cluster
         ax, ay = int(pos_A[a_idx, 0]), int(pos_A[a_idx, 1])
-        A_present[a_idx] = False
-        wA[a_idx] = 0.0
+        A_present[a_idx] = not A_present[a_idx]
+        wA[a_idx] = compute_A_rate(ax, ay, occ_mobile, A_present[a_idx])
         # occ_mobile はAを表さない(B/Sの占有専用)ので、ここでは触らない。
-        # このセルにちょうど重なっている可動粒子があれば、失ったオンサイト結合の分だけレートを更新する。
+        # このセルにちょうど重なっている可動粒子と4近傍の粒子について、
+        # オンサイト結合の増減に応じてレートを更新する。
         w, w_swap = update_after_A_change(ax, ay, occ_mobile, occ_idx, xm, ym, spm, A_pos_to_idx, A_present, w, w_swap)
 
     state['w'] = w
